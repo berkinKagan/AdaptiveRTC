@@ -1,0 +1,349 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>WebRTC AI Adaptation MVP + Data Logger</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background:#0b0b0c; color:#e6e6e6; margin:0; padding:16px; }
+  header { margin-bottom: 12px; }
+  .row { display:flex; gap:1rem; align-items:flex-start; flex-wrap:wrap; }
+  video { width: 46%; min-width: 320px; background:#000; aspect-ratio:16/9; border-radius:12px; }
+  pre { max-height: 220px; overflow: auto; background: #101214; color: #e6e6e6; padding: 8px 12px; border-radius:10px; }
+  .panel { background:#11131a; padding:12px; border-radius:12px; }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; }
+  button, input, select { background:#1a1d29; color:#e6e6e6; border:1px solid #2a2f42; padding:8px 10px; border-radius:8px; }
+  button:hover { background:#23283a; cursor:pointer; }
+  label { font-size: 0.9rem; opacity:0.9; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:6px 10px; }
+</style>
+<body>
+  <header>
+    <h2>WebRTC AI Adaptation MVP + Data Logger</h2>
+    <p>Loopback WebRTC call with heuristic bitrate adaptation and a <strong>getStats()</strong>-based data logger. Use under various network profiles and export CSV for ML training.</p>
+  </header>
+
+  <div class="row">
+    <video id="local" autoplay playsinline muted></video>
+    <video id="remote" autoplay playsinline muted></video>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="panel" style="flex:1; min-width: 320px;">
+      <div class="controls" style="margin-bottom:8px;">
+        <label>Network profile: <input id="profile" value="baseline"/></label>
+        <button id="btnStart">Start Sampling</button>
+        <button id="btnStop">Stop Sampling</button>
+        <button id="btnCsv">Download CSV</button>
+      </div>
+      <div class="controls" style="margin-bottom:8px;">
+        <label>Manual bitrate (kbps): <input id="manualBr" type="number" value="600"></label>
+        <button id="btnApplyBr">Apply</button>
+        <button id="btnToggleAdapt">Toggle Adaptation</button>
+      </div>
+      <div class="kv">
+        <div>Adaptation:</div><div id="adaptState">enabled</div>
+        <div>Current maxBitrate:</div><div id="brNow">—</div>
+        <div>Loss EMA (%):</div><div id="lossNow">—</div>
+        <div>RTT EMA (ms):</div><div id="rttNow">—</div>
+        <div>Jitter EMA (ms):</div><div id="jitNow">—</div>
+      </div>
+    </div>
+    <div class="panel" style="flex:1; min-width: 320px;">
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <script>
+    const $log = document.getElementById('log');
+    const log = (...a) => { $log.textContent += a.join(' ') + '\n'; $log.scrollTop = $log.scrollHeight; };
+    const $brNow = document.getElementById('brNow');
+    const $lossNow = document.getElementById('lossNow');
+    const $rttNow = document.getElementById('rttNow');
+    const $jitNow = document.getElementById('jitNow');
+    const $adaptState = document.getElementById('adaptState');
+
+    let pc1, pc2, sender, track;
+    let currentMaxBitrate = 300_000; // start at 300 kbps
+    const MIN_BITRATE = 150_000;
+    const MAX_BITRATE = 2_500_000;
+    const STEP_UP = 150_000;
+    const STEP_DOWN = 250_000;
+
+    let adaptationEnabled = true;
+
+    function ema(prev, value, alpha = 0.3) {
+      return prev === null ? value : alpha * value + (1 - alpha) * prev;
+    }
+    let emaLoss = null, emaRtt = null, emaJitter = null;
+
+    const SAMPLE_MS = 1000;
+    const SESSION_ID = crypto.randomUUID();
+    let NETWORK_PROFILE = document.getElementById('profile').value;
+    let loggerLast = {};
+    let rows = [];
+    let samplerHandle = null;
+    let maxBitrateSetKbps = null;
+
+    document.getElementById('btnStart').onclick = () => startSampling();
+    document.getElementById('btnStop').onclick = () => stopSampling();
+    document.getElementById('btnCsv').onclick = () => downloadCSV();
+    document.getElementById('btnApplyBr').onclick = async () => {
+      const kbps = parseInt(document.getElementById('manualBr').value || '0', 10);
+      if (Number.isFinite(kbps) && kbps > 0) {
+        await setMaxBitrate(kbps * 1000);
+        log('Manual set maxBitrate=', kbps, 'kbps');
+      }
+    };
+    document.getElementById('btnToggleAdapt').onclick = () => {
+      adaptationEnabled = !adaptationEnabled;
+      $adaptState.textContent = adaptationEnabled ? 'enabled' : 'disabled';
+      log('Adaptation', adaptationEnabled ? 'enabled' : 'disabled');
+    };
+    document.getElementById('profile').onchange = (e) => {
+      NETWORK_PROFILE = e.target.value;
+      log('Profile set to:', NETWORK_PROFILE);
+    };
+
+    (async function main() {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false });
+      document.getElementById('local').srcObject = stream;
+      track = stream.getVideoTracks()[0];
+
+      pc1 = new RTCPeerConnection();
+      pc2 = new RTCPeerConnection();
+
+      pc1.addTrack(track, stream);
+      sender = pc1.getSenders().find(s => s.track && s.track.kind === 'video');
+
+
+      pc2.ontrack = (e) => {
+      console.log("Remote track received", e.streams);
+      const remoteEl = document.getElementById('remote');
+      if (e.streams && e.streams[0]) {
+        remoteEl.srcObject = e.streams[0];
+      } else {
+        // Build a MediaStream if streams[] is empty
+        const ms = new MediaStream();
+        ms.addTrack(e.track);
+        remoteEl.srcObject = ms;
+      }
+    };
+
+
+      pc2.onicecandidate = e => e.candidate && pc1.addIceCandidate(e.candidate);
+      pc1.onicecandidate = e => e.candidate && pc2.addIceCandidate(e.candidate);
+
+      const offer = await pc1.createOffer();
+      await pc1.setLocalDescription(offer);
+      await pc2.setRemoteDescription(offer);
+      const answer = await pc2.createAnswer();
+      await pc2.setLocalDescription(answer);
+      await pc1.setRemoteDescription(answer);
+
+      await setMaxBitrate(currentMaxBitrate);
+
+      statsLoop();
+      controlLoop();
+    })();
+
+    async function setMaxBitrate(bps) {
+      const params = sender.getParameters();
+      if (!params.encodings || !params.encodings.length) {
+        params.encodings = [{}];
+      }
+      params.encodings[0].maxBitrate = Math.max(MIN_BITRATE, Math.min(MAX_BITRATE, Math.floor(bps)));
+      await sender.setParameters(params);
+      currentMaxBitrate = params.encodings[0].maxBitrate;
+      maxBitrateSetKbps = Math.floor(currentMaxBitrate / 1000);
+      $brNow.textContent = maxBitrateSetKbps + ' kbps';
+    }
+
+    function safe(n, fallback = null) {
+      return (typeof n === 'number' && Number.isFinite(n)) ? n : fallback;
+    }
+    function delta(curr, prev) {
+      if (prev == null || curr == null) return null;
+      const d = curr - prev;
+      return d >= 0 ? d : null;
+    }
+
+    async function statsLoop() {
+      while (true) {
+        await new Promise(r => setTimeout(r, 1000));
+        const stats = await pc1.getStats();
+        let outRtp, remInRtp, candidatePair, outboundTrack, codec;
+        stats.forEach(s => {
+          if (s.type === 'outbound-rtp' && s.kind === 'video' && !s.isRemote) outRtp = s;
+          if (s.type === 'remote-inbound-rtp' && s.kind === 'video') remInRtp = s;
+          if (s.type === 'candidate-pair' && s.nominated) candidatePair = s;
+          if (s.type === 'track' && s.kind === 'video' && s.remoteSource === false) outboundTrack = s;
+          if (s.type === 'codec' && s.mimeType && s.mimeType.startsWith('video/')) codec = s;
+        });
+
+        const rtt = candidatePair?.currentRoundTripTime ? candidatePair.currentRoundTripTime * 1000 : null; // ms
+        const jitter = remInRtp?.jitter ? remInRtp.jitter * 1000 : null; // ms
+        let lossPct = null;
+        if (remInRtp?.packetsLost != null && remInRtp?.packetsReceived != null) {
+          const lost = remInRtp.packetsLost;
+          const recvd = remInRtp.packetsReceived;
+          const total = lost + recvd;
+          lossPct = total > 0 ? (lost / total) * 100 : 0;
+        }
+
+        emaLoss = lossPct != null ? ema(emaLoss, lossPct, 0.4) : emaLoss;
+        emaRtt = rtt != null ? ema(emaRtt, rtt, 0.3) : emaRtt;
+        emaJitter = jitter != null ? ema(emaJitter, jitter, 0.3) : emaJitter;
+
+        $lossNow.textContent = (emaLoss != null) ? emaLoss.toFixed(2) : '—';
+        $rttNow.textContent  = (emaRtt  != null) ? emaRtt.toFixed(0) : '—';
+        $jitNow.textContent  = (emaJitter!= null) ? emaJitter.toFixed(0) : '—';
+
+        log(`bitrate=${(currentMaxBitrate/1000)|0}kbps  emaLoss=${emaLoss?.toFixed(2)}%  emaRtt=${emaRtt?.toFixed(0)}ms  emaJit=${emaJitter?.toFixed(0)}ms`);
+
+        await sampleOnce(stats, { outRtp, remInRtp, candidatePair, outboundTrack, codec });
+      }
+    }
+
+    async function controlLoop() {
+      while (true) {
+        await new Promise(r => setTimeout(r, 2000));
+
+        if (!adaptationEnabled) continue;
+        if (emaLoss == null || emaRtt == null) continue;
+
+        let target = currentMaxBitrate;
+        if (emaLoss > 3 || emaRtt > 250) {
+          target = Math.max(MIN_BITRATE, currentMaxBitrate - STEP_DOWN);
+        } else if (emaLoss < 1 && emaRtt < 120) {
+          target = Math.min(MAX_BITRATE, currentMaxBitrate + STEP_UP);
+        }
+        if (target !== currentMaxBitrate) {
+          await setMaxBitrate(target);
+          log(`ADAPT: new maxBitrate=${(currentMaxBitrate/1000)|0}kbps`);
+        }
+      }
+    }
+
+    async function sampleOnce(stats, picked) {
+      const now = performance.now();
+      const { outRtp, remInRtp, candidatePair, outboundTrack, codec } = picked || {};
+
+      const bytesSent      = safe(outRtp?.bytesSent);
+      const framesEncoded  = safe(outRtp?.framesEncoded);
+      const qpSum          = safe(outRtp?.qpSum);
+      const totalEncodeTime= safe(outRtp?.totalEncodeTime);
+      const retransPackets = safe(outRtp?.retransmittedPacketsSent);
+
+      const rtt_ms   = safe(candidatePair?.currentRoundTripTime * 1000);
+      const availOut = safe(candidatePair?.availableOutgoingBitrate);
+      const jitter_ms= safe(remInRtp?.jitter * 1000);
+      const pktsLost = safe(remInRtp?.packetsLost);
+      const pktsRecv = safe(remInRtp?.packetsReceived);
+      const framesDropped = safe(outboundTrack?.framesDropped);
+      const framesSent    = safe(outboundTrack?.framesSent);
+
+      const dt_ms = (loggerLast.t_ms != null) ? (now - loggerLast.t_ms) : null;
+      const d_bytesSent     = delta(bytesSent, loggerLast.bytesSent);
+      const d_framesEncoded = delta(framesEncoded, loggerLast.framesEncoded);
+      const d_qpSum         = delta(qpSum, loggerLast.qpSum);
+      const d_totalEncode   = delta(totalEncodeTime, loggerLast.totalEncodeTime);
+      const d_framesDropped = delta(framesDropped, loggerLast.framesDropped);
+      const d_framesSent    = delta(framesSent, loggerLast.framesSent);
+      const d_pktsLost      = delta(pktsLost, loggerLast.pktsLost);
+      const d_pktsRecv      = delta(pktsRecv, loggerLast.pktsRecv);
+
+      const out_bitrate_kbps = (dt_ms && d_bytesSent != null)
+          ? (d_bytesSent * 8 / (dt_ms / 1000)) / 1000
+          : null;
+
+      let recv_goodput_kbps = null;
+      const remBytes = safe(remInRtp?.bytesReceived);
+      const d_remBytes = delta(remBytes, loggerLast.remBytes);
+      if (dt_ms && d_remBytes != null) {
+        recv_goodput_kbps = (d_remBytes * 8 / (dt_ms / 1000)) / 1000;
+      }
+
+      let loss_pct_interval = null;
+      if (d_pktsLost != null && d_pktsRecv != null) {
+        const total = d_pktsLost + d_pktsRecv;
+        loss_pct_interval = total > 0 ? (d_pktsLost / total) * 100 : 0;
+      }
+
+      const fps = (dt_ms && d_framesEncoded != null) ? (d_framesEncoded / (dt_ms / 1000)) : null;
+      const encode_usage_pct = (dt_ms && d_totalEncode != null)
+          ? (d_totalEncode / (dt_ms / 1000)) * 100
+          : null;
+      const qp_avg = (d_qpSum != null && d_framesEncoded > 0) ? (d_qpSum / d_framesEncoded) : null;
+      const available_outgoing_kbps = (availOut != null) ? (availOut / 1000) : null;
+
+      const row = {
+        session_id: SESSION_ID,
+        network_profile: NETWORK_PROFILE,
+        timestamp_iso: new Date().toISOString(),
+        dt_ms,
+
+        rtt_ms,
+        jitter_ms,
+        loss_pct_interval,
+        out_bitrate_kbps,
+        available_outgoing_kbps,
+        fps,
+        framesDropped_interval: d_framesDropped,
+        framesSent_interval: d_framesSent,
+        encode_usage_pct,
+        qp_avg,
+        retrans_packets_interval: delta(retransPackets, loggerLast.retransPackets),
+
+        codec: codec?.mimeType || null,
+        ssrc: outRtp?.ssrc || null,
+
+        maxBitrate_set_kbps: maxBitrateSetKbps,
+        delta_bitrate_kbps: (loggerLast.maxBitrate_set_kbps != null && maxBitrateSetKbps != null)
+          ? (maxBitrateSetKbps - loggerLast.maxBitrate_set_kbps)
+          : 0,
+
+        recv_goodput_kbps_next_placeholder: recv_goodput_kbps
+      };
+      rows.push(row);
+
+      loggerLast = {
+        t_ms: now,
+        bytesSent, framesEncoded, qpSum, totalEncodeTime,
+        framesDropped, framesSent,
+        pktsLost, pktsRecv,
+        remBytes,
+        retransPackets,
+        maxBitrate_set_kbps: maxBitrateSetKbps
+      };
+    }
+
+    function startSampling() {
+      if (!samplerHandle) {
+        samplerHandle = setInterval(sampleOnce, SAMPLE_MS);
+        log('Sampling started.');
+      }
+    }
+    function stopSampling() {
+      if (samplerHandle) clearInterval(samplerHandle);
+      samplerHandle = null;
+      log('Sampling stopped.');
+    }
+
+    function downloadCSV() {
+      if (!rows.length) {
+        alert('No rows to export yet.');
+        return;
+      }
+      const headers = Object.keys(rows[0]);
+      const csv = [
+        headers.join(','),
+        ...rows.map(r => headers.map(h => (r[h] ?? '')).join(','))
+      ].join('\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = Object.assign(document.createElement('a'), { href: url, download: `webrtc_stats_${SESSION_ID}.csv` });
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    window.webrtcLogger = { startSampling, stopSampling, downloadCSV, setMaxBitrate };
+  </script>
+</body>
